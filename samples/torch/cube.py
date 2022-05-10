@@ -144,6 +144,10 @@ def fit_cube(max_iter          = 5000,
                 scl = display_res // img_o.shape[0]
                 img_b = np.repeat(np.repeat(img_b, scl, axis=0), scl, axis=1)
                 img_o = np.repeat(np.repeat(img_o, scl, axis=0), scl, axis=1)
+                print(img_b.shape)
+                print(img_o.shape)
+                print(img_d.shape)
+
                 result_image = make_grid(np.stack([img_o, img_b, img_d.detach().cpu().numpy()[::-1], img_r.cpu().numpy()[::-1]]))
 
                 if display_image:
@@ -163,7 +167,7 @@ def main():
     parser = argparse.ArgumentParser(description='Cube fit example')
     parser.add_argument('--outdir', help='Specify output directory', default='')
     parser.add_argument('--discontinuous', action='store_true', default=False)
-    parser.add_argument('--resolution', type=int, default=0, required=True)
+    parser.add_argument('--resolution', type=int, default=512)
     parser.add_argument('--display-interval', type=int, default=0)
     parser.add_argument('--mp4save-interval', type=int, default=100)
     parser.add_argument('--max-iter', type=int, default=1000)

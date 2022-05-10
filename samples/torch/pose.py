@@ -18,6 +18,9 @@ import util
 
 import nvdiffrast.torch as dr
 
+import cv2 
+
+
 #----------------------------------------------------------------------------
 # Quaternion math.
 #----------------------------------------------------------------------------
@@ -90,13 +93,25 @@ def q_mul_torch(p, q):
     return torch.stack([a, b, c, d])
 
 # Convert quaternion to 4x4 rotation matrix.
-def q_to_mtx(q):
+def q_to_mtx(q,scales=[1,1,1]):
     r0 = torch.stack([1.0-2.0*q[1]**2 - 2.0*q[2]**2, 2.0*q[0]*q[1] - 2.0*q[2]*q[3], 2.0*q[0]*q[2] + 2.0*q[1]*q[3]])
     r1 = torch.stack([2.0*q[0]*q[1] + 2.0*q[2]*q[3], 1.0 - 2.0*q[0]**2 - 2.0*q[2]**2, 2.0*q[1]*q[2] - 2.0*q[0]*q[3]])
     r2 = torch.stack([2.0*q[0]*q[2] - 2.0*q[1]*q[3], 2.0*q[1]*q[2] + 2.0*q[0]*q[3], 1.0 - 2.0*q[0]**2 - 2.0*q[1]**2])
     rr = torch.transpose(torch.stack([r0, r1, r2]), 1, 0)
     rr = torch.cat([rr, torch.tensor([[0], [0], [0]], dtype=torch.float32).cuda()], dim=1) # Pad right column.
     rr = torch.cat([rr, torch.tensor([[0, 0, 0, 1]], dtype=torch.float32).cuda()], dim=0)  # Pad bottom row.
+    # print(scales)
+    # raise()
+    scale = torch.eye(rr.shape[0]).cuda()
+    scale[0][0]*=scales[0]
+    scale[1][1]*=scales[1]
+    scale[2][2]*=scales[2]
+    # print(scale.shape)
+    # rr = rr * scale
+    rr = torch.matmul(scale,rr)
+    # rr = torch.matmul(rr,scale)
+    # raise()
+
     return rr
 
 # Transform vertex positions to clip space
@@ -108,10 +123,21 @@ def transform_pos(mtx, pos):
 
 def render(glctx, mtx, pos, pos_idx, col, col_idx, resolution: int):
     # Setup TF graph for reference.
+    # print(resolution)
+    # print('pos',pos,pos.shape)
+    # print('mtx',mtx,mtx.shape)
     pos_clip    = transform_pos(mtx, pos)
+    # print('pos_clip',pos_clip,pos_clip.shape)
     rast_out, _ = dr.rasterize(glctx, pos_clip, pos_idx, resolution=[resolution, resolution])
+    # print('pos_idx',pos_idx,pos_idx.shape)
+    # print('rast_out',rast_out,rast_out.shape)
+    # print('col',col,col.shape)
+    # print('col_idx',col_idx,col_idx.shape)
+
     color   , _ = dr.interpolate(col[None, ...], rast_out, col_idx)
     color       = dr.antialias(color, rast_out, pos_clip, pos_idx)
+    # print('color',color,color.shape)
+    # raise()
     return color
 
 #----------------------------------------------------------------------------
@@ -148,6 +174,10 @@ def fit_pose(max_iter           = 10000,
     datadir = f'{pathlib.Path(__file__).absolute().parents[1]}/data'
     with np.load(f'{datadir}/cube_p.npz') as f:
         pos_idx, pos, col_idx, col = f.values()
+    print("col_idx",col_idx,col_idx.shape)
+    print("col",col,col.shape)
+    # col = np.ones(col.shape)
+    
     print("Mesh has %d triangles and %d vertices." % (pos_idx.shape[0], pos.shape[0]))
 
     # Some input geometry contains vertex positions in (N, 4) (with v[:,3]==1).  Drop
@@ -162,8 +192,14 @@ def fit_pose(max_iter           = 10000,
 
     glctx = dr.RasterizeGLContext()
 
+    import nvisii
+
     for rep in range(repeats):
-        pose_target = torch.tensor(q_rnd(), device='cuda')
+        # pose_target = torch.tensor(q_rnd(), device='cuda')
+        pose_target = torch.tensor([0,0,0,1], device='cuda')
+        pose_target = torch.tensor([0,0,0,1], device='cuda')
+        # scale_target = torch.tensor([np.random.uniform(0.1,1),np.random.uniform(0.1,1),np.random.uniform(0.1,1)], device='cuda')
+        scale_target = torch.tensor([0.5,1,1], device='cuda')
         pose_init   = q_rnd()
         pose_opt    = torch.tensor(pose_init / np.sum(pose_init**2)**0.5, dtype=torch.float32, device='cuda', requires_grad=True)
 
@@ -171,7 +207,8 @@ def fit_pose(max_iter           = 10000,
         pose_best   = pose_opt.detach().clone()
 
         # Modelview + projection matrix.
-        mvp = torch.tensor(np.matmul(util.projection(x=0.4), util.translate(0, 0, -3.5)).astype(np.float32), device='cuda')
+        mvp = torch.tensor(np.matmul(
+            util.projection(x=0.4), util.translate(0, 0, -3.5)).astype(np.float32), device='cuda')
 
         # Adam optimizer for texture with a learning rate ramp.
         optimizer = torch.optim.Adam([pose_opt], betas=(0.9, 0.999), lr=lr_base)
@@ -192,7 +229,7 @@ def fit_pose(max_iter           = 10000,
                 noise = q_mul(noise, q_rnd_S4()) # Orientation noise.
 
             # Render.
-            color          = render(glctx, torch.matmul(mvp, q_to_mtx(pose_target)), vtx_pos, pos_idx, vtx_col, col_idx, resolution)
+            color          = render(glctx, torch.matmul(mvp, q_to_mtx(pose_target,scale_target)), vtx_pos, pos_idx, vtx_col, col_idx, resolution)
             pose_total_opt = q_mul_torch(pose_opt, noise)
             mtx_total_opt  = torch.matmul(mvp, q_to_mtx(pose_total_opt))
             color_opt      = render(glctx, mtx_total_opt, vtx_pos, pos_idx, vtx_col, col_idx, resolution)
@@ -239,7 +276,12 @@ def fit_pose(max_iter           = 10000,
                 result_image = np.concatenate([img_ref, img_best, img_opt], axis=1)[::-1]
 
                 if display_image:
-                    util.display_image(result_image, size=display_res, title='(%d) %d / %d' % (rep, it, max_iter))
+
+                    # util.display_image(result_image, size=display_res, title='(%d) %d / %d' % (rep, it, max_iter))
+                    cv2.imshow("im",result_image)
+                    k = cv2.waitKey(33)
+                    if k==27:    # Esc key to stop
+                        break
                 if save_mp4:
                     writer.append_data(np.clip(np.rint(result_image*255.0), 0, 255).astype(np.uint8))
 
