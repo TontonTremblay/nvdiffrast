@@ -134,16 +134,21 @@ def transform_pos(mtx, pos):
     t_mtx = torch.from_numpy(mtx).cuda() if isinstance(mtx, np.ndarray) else mtx
     # (x,y,z) -> (x,y,z,1)
     posw = torch.cat([pos, torch.ones([pos.shape[0], 1]).cuda()], axis=1)
+    # print(posw.shape,t_mtx.t().shape)
+    # raise()
     return torch.matmul(posw, t_mtx.t())[None, ...]
 
 def render(glctx, mtx, pos, pos_idx, col, col_idx, resolution: int):
     # Setup TF graph for reference.
     # print(resolution)
-    # print('pos',pos,pos.shape)
+    print('pos',pos,pos.shape)
     # print('mtx',mtx,mtx.shape)
     pos_clip    = transform_pos(mtx, pos)
     # print('pos_clip',pos_clip,pos_clip.shape)
     rast_out, _ = dr.rasterize(glctx, pos_clip, pos_idx, resolution=[resolution, resolution])
+    # print("rast_out",torch.min(rast_out[0,:,:,2]),torch.max(rast_out[0,:,:,2]))
+    depth = rast_out[0,:,:,2]
+    # raisZe()
     # print('pos_idx',pos_idx,pos_idx.shape)
     # print('rast_out',rast_out,rast_out.shape)
     # print('col',col,col.shape)
@@ -153,7 +158,7 @@ def render(glctx, mtx, pos, pos_idx, col, col_idx, resolution: int):
     color       = dr.antialias(color, rast_out, pos_clip, pos_idx)
     # print('color',color,color.shape)
     # raise()
-    return color
+    return color,depth
 
 def length(v):
     return math.sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2])
@@ -218,60 +223,26 @@ def fit_pose(max_iter           = 10000,
     datadir = f'{pathlib.Path(__file__).absolute().parents[1]}/data'
 
     with np.load(f'{datadir}/cube_p.npz') as f:
-        pos_idx_cube, pos_cube, col_idx_cube, col_cube = f.values()
+        pos_idx, pos, col_idx, col = f.values()
 
-    print("pos_idx_cube",pos_idx_cube,pos_idx_cube.shape)
-    print("pos_cube",pos_cube,pos_cube.shape)
-    print("col_idx_cube",col_idx_cube,col_idx_cube.shape)
-    print("col_cube",col_cube,col_cube.shape)
-    col_cubewhite = np.ones(col_cube.shape)
+    print("pos_idx",pos_idx,pos_idx.shape)
+    print("pos",pos,pos.shape)
+    print("col_idx",col_idx,col_idx.shape)
+    print("col",col,col.shape)
+    col_white = np.ones(col.shape)
     
-    print("Mesh has %d triangles and %d vertices." % (pos_idx_cube.shape[0], pos_cube.shape[0]))
+    print("Mesh has %d triangles and %d vertices." % (pos_idx.shape[0], pos.shape[0]))
 
     # Some input geometry contains vertex positions in (N, 4) (with v[:,3]==1).  Drop
     # the last column in that case.
-    if pos_cube.shape[1] == 4: pos_cube = pos_cube[:, 0:3]
+    if pos.shape[1] == 4: pos = pos[:, 0:3]
 
     # Create position/triangle index tensors
-    pos_idx_cube = torch.from_numpy(pos_idx_cube.astype(np.int32)).cuda()
-    vtx_pos_cube = torch.from_numpy(pos_cube.astype(np.float32)).cuda()
-    col_idx_cube = torch.from_numpy(col_idx_cube.astype(np.int32)).cuda()
-    vtx_col_cube = torch.from_numpy(col_cube.astype(np.float32)).cuda()
-    vtx_col_cubewhite = torch.from_numpy(col_cubewhite.astype(np.float32)).cuda()
-
-
-    ############ OTHER SHAPE #############
-
-    import nvisii 
-    nvisii.initialize(headless=True)
-    mesh = nvisii.mesh.create_capsule("capsule",radius=1,size=1)
-    pos_mesh = np.array(mesh.get_vertices())
-    ids_mesh = np.array(mesh.get_triangle_indices()).reshape((-1,3))
-    print('pos_mesh',pos_mesh.shape)
-    print('ids_mesh',ids_mesh.shape)
-    # raise()
-
-    
-    print("pos_idx_cube",pos_idx_cube,pos_idx_cube.shape)
-    print("pos_cube",pos_cube,pos_cube.shape)
-    print("col_idx_cube",col_idx_cube,col_idx_cube.shape)
-    print("col_cube",col_cube,col_cube.shape)
-    col_cubewhite = np.ones(col_cube.shape)
-    
-    print("Mesh has %d triangles and %d vertices." % (pos_idx_cube.shape[0], pos_cube.shape[0]))
-
-    # Some input geometry contains vertex positions in (N, 4) (with v[:,3]==1).  Drop
-    # the last column in that case.
-    if pos_cube.shape[1] == 4: pos_cube = pos_cube[:, 0:3]
-
-    # Create position/triangle index tensors
-    pos_idx_cube = torch.from_numpy(pos_idx_cube.astype(np.int32)).cuda()
-    vtx_pos_cube = torch.from_numpy(pos_cube.astype(np.float32)).cuda()
-    col_idx_cube = torch.from_numpy(col_idx_cube.astype(np.int32)).cuda()
-    vtx_col_cube = torch.from_numpy(col_cube.astype(np.float32)).cuda()
-    vtx_col_cubewhite = torch.from_numpy(col_cubewhite.astype(np.float32)).cuda()
-
-
+    pos_idx = torch.from_numpy(pos_idx.astype(np.int32)).cuda()
+    vtx_pos = torch.from_numpy(pos.astype(np.float32)).cuda()
+    col_idx = torch.from_numpy(col_idx.astype(np.int32)).cuda()
+    vtx_col = torch.from_numpy(col.astype(np.float32)).cuda()
+    vtx_col_white = torch.from_numpy(col_white.astype(np.float32)).cuda()
     glctx = dr.RasterizeGLContext()
 
     # import nvisii
@@ -311,10 +282,15 @@ def fit_pose(max_iter           = 10000,
         trans_target  = torch.tensor([0,0,1], device='cuda')
 
 
+        # pose_target = torch.tensor(q_rnd(), device='cuda')
+        pose_target = torch.tensor([0,0,0,1], device='cuda')
+        scale_target = torch.tensor([1,1,1], device='cuda')
+        trans_target  = torch.tensor([0,0,0], device='cuda')
 
-        pose_target   = torch.tensor(q_rnd(), device='cuda')
-        scale_target = torch.tensor([np.random.uniform(0.1,1),np.random.uniform(0.1,1),np.random.uniform(0.1,1)], device='cuda')
-        trans_target = torch.tensor([np.random.uniform(-1,1),np.random.uniform(-1,1),np.random.uniform(-1,1)], device='cuda')
+
+        # pose_target   = torch.tensor(q_rnd(), device='cuda')
+        # scale_target = torch.tensor([np.random.uniform(0.1,1),np.random.uniform(0.1,1),np.random.uniform(0.1,1)], device='cuda')
+        # trans_target = torch.tensor([np.random.uniform(-1,1),np.random.uniform(-1,1),np.random.uniform(-1,1)], device='cuda')
 
         cuboid = None
         # cuboid = Cuboid(pose_init,trans_init,scale_init).cuda()
@@ -339,6 +315,8 @@ def fit_pose(max_iter           = 10000,
             mvp = torch.tensor(np.matmul(
                 util.projection(x=0.4), mtx_cam).astype(np.float32), device='cuda')
             multiview_cameras.append(mvp)
+        
+        
 
         # lookat
         # Adam optimizer for texture with a learning rate ramp.
@@ -375,9 +353,11 @@ def fit_pose(max_iter           = 10000,
 
             color_white_gt_all = []
             color_gt_all = []
-            color_white_opt_all = []
+            depth_gt_all = []
             color_white_opt_all = []
             color_opt_all = []
+            depth_opt_all = []
+
             loss_all = None
             for i_cam,mtx_cam in enumerate(multiview_cameras):
 
@@ -393,12 +373,13 @@ def fit_pose(max_iter           = 10000,
                                 )
                             )
                          )
-                color_white_gt   = render(glctx, 
+
+                color_white_gt,depth_gt   = render(glctx, 
                                     mtx_gt, 
-                                    vtx_pos_cube, 
-                                    pos_idx_cube, 
-                                    vtx_col_cubewhite, 
-                                    col_idx_cube, 
+                                    vtx_pos, 
+                                    pos_idx, 
+                                    vtx_col_white, 
+                                    col_idx, 
                                     resolution
                                 )
 
@@ -415,16 +396,18 @@ def fit_pose(max_iter           = 10000,
                 ####
 
 
-                color_gt   = render(glctx, 
+                color_gt,_  = render(glctx, 
                                     mtx_gt, 
-                                    vtx_pos_cube, 
-                                    pos_idx_cube, 
-                                    vtx_col_cube, 
-                                    col_idx_cube, 
+                                    vtx_pos, 
+                                    pos_idx, 
+                                    vtx_col, 
+                                    col_idx, 
                                     resolution
                                 )
                 color_white_gt_all.append(color_white_gt)
                 color_gt_all.append(color_gt)
+                depth_gt = depth_gt.unsqueeze(0).unsqueeze(-1)
+                depth_gt_all.append(torch.cat([depth_gt,depth_gt,depth_gt],axis=-1))
 
                 mtx_gu = torch.matmul(
                             mtx_cam, 
@@ -439,27 +422,13 @@ def fit_pose(max_iter           = 10000,
 
                 # pose_total_opt = q_mul_torch(pose_opt, noise)
                 # mtx_total_opt  = torch.matmul(mvp, q_to_mtx(pose_total_opt))
-                color_white_opt = render(glctx, 
-                                         mtx_gu, 
-                                         vtx_pos_cube, 
-                                         pos_idx_cube, 
-                                         vtx_col_cubewhite, 
-                                         col_idx_cube, 
-                                         resolution
-                                        )
-                
-                color_opt       = render(glctx, 
-                                         mtx_gu, 
-                                         vtx_pos_cube, 
-                                         pos_idx_cube, 
-                                         vtx_col_cube, 
-                                         col_idx_cube, 
-                                         resolution
-                                        )
+                color_white_opt,depth_opt = render(glctx, mtx_gu, vtx_pos, pos_idx, vtx_col_white, col_idx, resolution)
+                color_opt ,_      = render(glctx, mtx_gu, vtx_pos, pos_idx, vtx_col, col_idx, resolution)
 
                 color_white_opt_all.append(color_white_opt)
                 color_opt_all.append(color_opt)
-
+                depth_opt = depth_opt.unsqueeze(0).unsqueeze(-1)
+                depth_opt_all.append(torch.cat([depth_opt,depth_opt,depth_opt],axis=-1))
                 # Image-space loss.
                 # diff = (color_white_opt - color_white_gt)**2 # L2 norm.
                 diff = torch.abs(color_white_opt - color_white_gt) # L2 norm.
@@ -527,7 +496,7 @@ def fit_pose(max_iter           = 10000,
                     gt_final = np.concatenate(col_imgs, axis=0)
                     return cv2.resize(gt_final,(512,512))
 
-                img_ref  = getimg_stack(color_gt_all)
+                img_ref  = getimg_stack(depth_gt_all)
                 img_opt  = getimg_stack(color_opt_all)
                 img_best = getimg_stack(color_best_all)
                 

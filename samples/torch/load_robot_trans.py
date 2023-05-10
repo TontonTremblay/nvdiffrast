@@ -11,6 +11,7 @@ import os
 import pathlib
 import sys
 import numpy as np
+
 import torch
 import imageio
 
@@ -20,7 +21,9 @@ import nvdiffrast.torch as dr
 
 import cv2 
 import math 
-
+import open3d as o3d
+import warnings
+warnings.filterwarnings('ignore')
 
 #----------------------------------------------------------------------------
 # Quaternion math.
@@ -136,6 +139,15 @@ def transform_pos(mtx, pos):
     posw = torch.cat([pos, torch.ones([pos.shape[0], 1]).cuda()], axis=1)
     return torch.matmul(posw, t_mtx.t())[None, ...]
 
+
+def transform_pos_numpy(mtx, pos):
+    pos = torch.from_numpy(pos)
+    t_mtx = torch.from_numpy(mtx) if isinstance(mtx, np.ndarray) else mtx
+    # (x,y,z) -> (x,y,z,1)
+    posw = torch.cat([pos, torch.ones([pos.shape[0], 1])], axis=1)
+    # print(posw.shape,t_mtx.t().shape)
+    return torch.matmul(posw, t_mtx.t()).numpy()
+
 def render(glctx, mtx, pos, pos_idx, col, col_idx, resolution: int):
     # Setup TF graph for reference.
     # print(resolution)
@@ -181,16 +193,29 @@ def lookat(eye, target, up):
     return np.array([mx[0], my[0], mz[0], 0, mx[1], my[1], mz[1], 0, mx[2], my[2], mz[2], 0, tx, ty, tz, 1])
 
 
+def lookat_torch(eye, target, up):
+    print(eye)
+    print(target)
+    mz = normalize( (eye[0]-target[0], eye[1]-target[1], eye[2]-target[2]) ) # inverse line of sight
+    mx = normalize( cross( up, mz ) )
+    my = normalize( cross( mz, mx ) )
+    tx =  dot( mx, eye )
+    ty =  dot( my, eye )
+    tz = -dot( mz, eye )   
+    print(mx)
+    return torch.tensor([mx[0], my[0], mz[0], 0, mx[1], my[1], mz[1], 0, mx[2], my[2], mz[2], 0, tx, ty, tz, 1])
+
+
 #----------------------------------------------------------------------------
 # Cube pose fitter.
 #----------------------------------------------------------------------------
 
-def fit_pose(max_iter           = 10000,
-             repeats            = 1,
+def fit_pose(max_iter           = 1000,
+             repeats            = 10,
              log_interval       = 10,
              display_interval   = None,
              display_res        = 512,
-             lr_base            = 0.01,
+             lr_base            = 0.001,
              lr_falloff         = 1.0,
              nr_base            = 1.0,
              nr_falloff         = 1e-4,
@@ -217,67 +242,143 @@ def fit_pose(max_iter           = 10000,
 
     datadir = f'{pathlib.Path(__file__).absolute().parents[1]}/data'
 
-    with np.load(f'{datadir}/cube_p.npz') as f:
-        pos_idx_cube, pos_cube, col_idx_cube, col_cube = f.values()
+    import open3d as o3d
 
-    print("pos_idx_cube",pos_idx_cube,pos_idx_cube.shape)
-    print("pos_cube",pos_cube,pos_cube.shape)
-    print("col_idx_cube",col_idx_cube,col_idx_cube.shape)
-    print("col_cube",col_cube,col_cube.shape)
-    col_cubewhite = np.ones(col_cube.shape)
+
+    pos_idx = None
+    pos = None
+    col_idx = None
+    col = None
+
+    # read the urdf 
+
+    from yourdfpy import URDF
+    import yourdfpy
+    import random 
+    import pyrr
+    np.random.seed(101012)
+    random.seed(101012)
+    urdf_content_path = "/home/jtremblay/code/visii_dr/content/urdf/kinova_description/"
+    robot = URDF.load(f"{urdf_content_path}/urdf/kinova.urdf")
+
+    v = [0.0, -4.95569171455048, -2.774211677484724, 3.1948753258336526, -2.6901821783304887, -3.0518731415223153, 3.8222728696691832, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    cfg_start = {}
+    for i_join, joint_name in enumerate(robot.joint_names):
+        j = robot.joint_map[joint_name]
+        if not j.limit is None: 
+            # print(j.limit)
+            cfg_start[joint_name] = random.uniform(j.limit.lower,j.limit.upper)
+            # cfg_start[joint_name] = v[i_join]
+    robot.update_cfg(cfg_start)
     
-    print("Mesh has %d triangles and %d vertices." % (pos_idx_cube.shape[0], pos_cube.shape[0]))
+    added = -1 
 
-    # Some input geometry contains vertex positions in (N, 4) (with v[:,3]==1).  Drop
-    # the last column in that case.
-    if pos_cube.shape[1] == 4: pos_cube = pos_cube[:, 0:3]
+    for link in robot.link_map.keys():    
+        link_name = link
+        link = robot.link_map[link]
+        print(link_name)
+        for visual in link.visuals:    
+            if not visual.geometry.mesh is None:
+                added += 1
+                path = visual.geometry.mesh.filename.replace("package://kinova_description/",'')
+                data_2_load = os.path.join(urdf_content_path,path)
+                print(" ",data_2_load)
+                if 'dae' in data_2_load:
+                    continue
+                m = o3d.io.read_triangle_mesh(data_2_load)
+                pos_3 = np.asarray(m.vertices)
+                pos_m = np.ones([pos_3.shape[0],4])
+                pos_m[:,:3] = pos_3
+                
+                # update the vertices 
+                trans = np.array(robot.get_transform(link_name))
+                pos_m = transform_pos_numpy(pyrr.Matrix44.from_x_rotation(-np.pi/2),
+                    transform_pos_numpy(trans, pos_m[:,:3])[:,:3])
+                pos_idx_m = np.asarray(m.triangles)
+                if not pos_idx is None:
 
-    # Create position/triangle index tensors
-    pos_idx_cube = torch.from_numpy(pos_idx_cube.astype(np.int32)).cuda()
-    vtx_pos_cube = torch.from_numpy(pos_cube.astype(np.float32)).cuda()
-    col_idx_cube = torch.from_numpy(col_idx_cube.astype(np.int32)).cuda()
-    vtx_col_cube = torch.from_numpy(col_cube.astype(np.float32)).cuda()
-    vtx_col_cubewhite = torch.from_numpy(col_cubewhite.astype(np.float32)).cuda()
+                    print('yeahhhhh')
+                    print('pos_idx.shape[0]',pos_idx.shape[0])
+                    print('avant',np.min(pos_idx_m),np.max(pos_idx_m))
+                    pos_idx_m = pos_idx_m + np.ones(pos_idx_m.shape) * (pos.shape[0])
+                    pos_idx_m = pos_idx_m.astype(np.int)
+                    print('apres',np.min(pos_idx_m),np.max(pos_idx_m))
+                
+                if pos is None:
+                    col_idx_m = np.zeros(pos_idx_m.shape)
+                else:
+                    col_idx_m = np.ones(pos_idx_m.shape) * col.shape[0]
+                    col_idx_m = col_idx_m.astype(np.int)
+                # col_idx_m = np.zeros(pos_idx_m.shape)
+
+                # col =  np.ones(pos_3.shape)
+                col_m =  np.random.uniform(0.1,0.9,[1,3])
+
+                if pos is None:
+                    pos = pos_m 
+                    pos_idx = pos_idx_m
+                    col = col_m
+                    col_idx = col_idx_m
+                else:
+                    pos = np.concatenate([pos,pos_m], 0)
+                    pos_idx = np.concatenate([pos_idx,pos_idx_m], 0)
+                    col = np.concatenate([col,col_m], 0)
+                    col_idx = np.concatenate([col_idx,col_idx_m], 0)
+
+                print('added',added)    
+                print("pos_idx_m",pos_idx_m[0],pos_idx_m.shape)
+                print(np.min(pos_idx_m),np.max(pos_idx_m))
+                print("pos_m",pos_m[0],pos_m.shape)
+                print("col_idx_m",col_idx_m[0],col_idx_m.shape)
+                print("col_m",col_m[0],col_m.shape)
+                
+
+                print('------- ALLLL ------')    
+                print("pos_idx",pos_idx[0],pos_idx.shape)
+                print(np.min(pos_idx),np.max(pos_idx))
+                print("pos",pos[0],pos.shape)
+                print("col_idx",col_idx[0],col_idx.shape)
+                print("col",col[0],col.shape)
+                
+        #         break
+        # break
+        # if added == 1: 
+        #     break
+
+    # thefile = open('test.obj', 'w')
+    # for i_pos,position in enumerate(pos):
+    #     thefile.write("v {0} {1} {2}\n".format(position[0],position[1],position[2]))
+
+    # # for item in faces:
+    # for i_pos,item in enumerate(pos_idx):
+    #     thefile.write("f {0}//{0} {1}//{1} {2}//{2}\n".format(item[0]+1,item[1]+1,item[2]+1))  
+
+    # thefile.close()
 
 
-    ############ OTHER SHAPE #############
 
-    import nvisii 
-    nvisii.initialize(headless=True)
-    mesh = nvisii.mesh.create_capsule("capsule",radius=1,size=1)
-    pos_mesh = np.array(mesh.get_vertices())
-    ids_mesh = np.array(mesh.get_triangle_indices()).reshape((-1,3))
-    print('pos_mesh',pos_mesh.shape)
-    print('ids_mesh',ids_mesh.shape)
+    col_white = np.ones(col.shape)
+
+    # print("Mesh has %d triangles and %d vertices." % (pos_idx.shape[0], pos.shape[0]))
+
     # raise()
 
-    
-    print("pos_idx_cube",pos_idx_cube,pos_idx_cube.shape)
-    print("pos_cube",pos_cube,pos_cube.shape)
-    print("col_idx_cube",col_idx_cube,col_idx_cube.shape)
-    print("col_cube",col_cube,col_cube.shape)
-    col_cubewhite = np.ones(col_cube.shape)
-    
-    print("Mesh has %d triangles and %d vertices." % (pos_idx_cube.shape[0], pos_cube.shape[0]))
-
     # Some input geometry contains vertex positions in (N, 4) (with v[:,3]==1).  Drop
     # the last column in that case.
-    if pos_cube.shape[1] == 4: pos_cube = pos_cube[:, 0:3]
+    if pos.shape[1] == 4: pos = pos[:, 0:3]
 
     # Create position/triangle index tensors
-    pos_idx_cube = torch.from_numpy(pos_idx_cube.astype(np.int32)).cuda()
-    vtx_pos_cube = torch.from_numpy(pos_cube.astype(np.float32)).cuda()
-    col_idx_cube = torch.from_numpy(col_idx_cube.astype(np.int32)).cuda()
-    vtx_col_cube = torch.from_numpy(col_cube.astype(np.float32)).cuda()
-    vtx_col_cubewhite = torch.from_numpy(col_cubewhite.astype(np.float32)).cuda()
-
-
+    pos_idx = torch.from_numpy(pos_idx.astype(np.int32)).cuda()
+    vtx_pos = torch.from_numpy(pos.astype(np.float32)).cuda()
+    col_idx = torch.from_numpy(col_idx.astype(np.int32)).cuda()
+    vtx_col = torch.from_numpy(col.astype(np.float32)).cuda()
+    vtx_col_white = torch.from_numpy(col_white.astype(np.float32)).cuda()
     glctx = dr.RasterizeGLContext()
 
     # import nvisii
 
-    class Cuboid(torch.nn.Module):
-        def __init__(self, q,trans,scale):
+    class CameraTorch(torch.nn.Module):
+        def __init__(self, q,trans):
             super().__init__()
 
             self.qx = torch.nn.Parameter(torch.tensor(q[0]))
@@ -288,10 +389,9 @@ def fit_pose(max_iter           = 10000,
             self.x = torch.nn.Parameter(torch.tensor(trans[0]))
             self.y = torch.nn.Parameter(torch.tensor(trans[1]))
             self.z = torch.nn.Parameter(torch.tensor(trans[2]))
-
-            self.rx = torch.nn.Parameter(torch.tensor(scale[0]))
-            self.ry = torch.nn.Parameter(torch.tensor(scale[1]))
-            self.rz = torch.nn.Parameter(torch.tensor(scale[2]))
+            # self.rx = torch.nn.Parameter(torch.tensor(scale[0]))
+            # self.ry = torch.nn.Parameter(torch.tensor(scale[1]))
+            # self.rz = torch.nn.Parameter(torch.tensor(scale[2]))
 
 
         def forward(self):
@@ -299,56 +399,40 @@ def fit_pose(max_iter           = 10000,
             return {
                 "quat": [self.qx,self.qy,self.qz,self.qw],
                 'trans': [self.x,self.y,self.z,],
-                'scale': [self.rx,self.ry,self.rz,],
             }
-
     for rep in range(repeats):
-        # pose_target = torch.tensor(q_rnd(), device='cuda')
-        pose_target = torch.tensor([0,0,0,1], device='cuda')
-        pose_target = torch.tensor([0.354,0.354,0.146,0.854], device='cuda')
-        # scale_target = torch.tensor([np.random.uniform(0.1,1),np.random.uniform(0.1,1),np.random.uniform(0.1,1)], device='cuda')
-        scale_target = torch.tensor([0.5,1,0.5], device='cuda')
-        trans_target  = torch.tensor([0,0,1], device='cuda')
+        mtx_cam = lookat(
+             [
+                -1.5330392167554536,
+                -0.8017582077755034,
+                0.7717230792267187
+            ],
+            [
+                0.02902800217270851,
+                -0.07310445606708527,
+                -0.06623277068138123
+            ],
+            [
+                0,
+                0,
+                1
+            ]
+        )
+        mtx_cam = np.array(mtx_cam).reshape((4,4)).T
 
+        mvp_gt = torch.tensor(np.matmul(
+            util.projection(x=0.4), mtx_cam).astype(np.float32), device='cuda')
 
-
-        pose_target   = torch.tensor(q_rnd(), device='cuda')
-        scale_target = torch.tensor([np.random.uniform(0.1,1),np.random.uniform(0.1,1),np.random.uniform(0.1,1)], device='cuda')
-        trans_target = torch.tensor([np.random.uniform(-1,1),np.random.uniform(-1,1),np.random.uniform(-1,1)], device='cuda')
-
-        cuboid = None
-        # cuboid = Cuboid(pose_init,trans_init,scale_init).cuda()
-
-        # Modelview + projection matrix.
-
-
-        multiview_cameras = []
-        # for i in range(20):
-        nb_cameras = 20
-
-        for i_cam in range(nb_cameras):
-            mvp = torch.tensor(np.matmul(
-                util.projection(x=0.4), util.translate(0, 0, -3.5)).astype(np.float32), device='cuda')
-            # mtx_cam = lookat([0,0,3.5],[0,0,0],[0,1,0])
-            mtx_cam = lookat(
-                [np.random.uniform(-4,4),np.random.uniform(-4,4),np.random.uniform(-4,4)],
-                [0,0,0],
-                [0,1,0])
-            mtx_cam = np.array(mtx_cam).reshape((4,4)).T
-
-            mvp = torch.tensor(np.matmul(
-                util.projection(x=0.4), mtx_cam).astype(np.float32), device='cuda')
-            multiview_cameras.append(mvp)
-
-        # lookat
-        # Adam optimizer for texture with a learning rate ramp.
-        # Render.
 
         best_data = None
         color_best = None
         color_white_best = None
         loss_best = np.inf
 
+        cam_guess = None
+        # print(np.eye(4))
+        centered_cam = torch.tensor(np.matmul(
+                util.projection(x=0.4), np.eye(4)).astype(np.float32), device='cuda')
 
         for it in range(max_iter + 1):
             # Set learning rate.
@@ -357,21 +441,34 @@ def fit_pose(max_iter           = 10000,
 
 
             # Noise input.
-            if itf < grad_phase_start:
-                result = {}
-                pose_init   = torch.tensor(q_rnd(), device='cuda')
-                scale_init = torch.tensor([np.random.uniform(0.1,1),np.random.uniform(0.1,1),np.random.uniform(0.1,1)], device='cuda')
-                trans_init = torch.tensor([np.random.uniform(-1,1),np.random.uniform(-1,1),np.random.uniform(-1,1)], device='cuda')
-                result['quat'] = pose_init
-                result['trans'] = trans_init
-                result['scale'] = scale_init
-            elif cuboid is None :
-                cuboid = Cuboid(best_data['quat'],best_data['trans'],best_data['scale']).cuda()
-                optimizer = torch.optim.Adam(cuboid.parameters(), betas=(0.9, 0.999), lr=lr_base)
-                result = cuboid()
+            if cam_guess is None:
 
+                mtx_cam = lookat(
+                     [
+                        -1.5330392167554536 + random.uniform(-0.05, .05),
+                        -0.8017582077755034+ random.uniform(-0.05, .05),
+                        0.7717230792267187 + random.uniform(-0.05, .05)
+                    ],
+                    [
+                        0.02902800217270851 + random.uniform(-0.05, .05),
+                        -0.07305445606708527 + random.uniform(-0.05, .05),
+                        -0.06623277068138053 + random.uniform(-0.05, .05)
+                    ],
+                    [
+                        0,
+                        0,
+                        1
+                    ]
+                )
+                mtx_cam = mtx_cam.reshape((4,4)).T
+                cam_guess = CameraTorch(
+                    q = pyrr.Matrix44(mtx_cam.T).quaternion.xyzw,
+                    trans = [mtx_cam[0,-1],mtx_cam[1,-1],mtx_cam[2,-1]] 
+                    ).cuda()
+                optimizer = torch.optim.Adam(cam_guess.parameters(), betas=(0.9, 0.999), lr=lr_base)
+                result = cam_guess()
             else:
-                result = cuboid()
+                result = cam_guess()
 
             color_white_gt_all = []
             color_gt_all = []
@@ -379,97 +476,59 @@ def fit_pose(max_iter           = 10000,
             color_white_opt_all = []
             color_opt_all = []
             loss_all = None
-            for i_cam,mtx_cam in enumerate(multiview_cameras):
 
-
-                # Render.
-                mtx_gt = torch.matmul(
-                            mtx_cam, 
-                            torch.matmul(
-                                translation_to_mtx(trans_target),
-                                torch.matmul(
-                                    q_to_mtx(pose_target),
-                                    scale_to_mtx(scale_target)
-                                )
+            color_white_gt   = render(glctx, 
+                                mvp_gt, 
+                                vtx_pos, 
+                                pos_idx, 
+                                vtx_col_white, 
+                                col_idx, 
+                                resolution
                             )
-                         )
-                color_white_gt   = render(glctx, 
-                                    mtx_gt, 
-                                    vtx_pos_cube, 
-                                    pos_idx_cube, 
-                                    vtx_col_cubewhite, 
-                                    col_idx_cube, 
-                                    resolution
-                                )
-
-                ####
-                if args.add_noise:
-                    from skimage.util import random_noise
-                    # def gaussian_noise(img):
-                    #     gauss_img = torch.tensor(random_noise(img, mode='gaussian', mean=0, var=0.05, clip=True))
-                    #         # save_noisy_image(gauss_img, f"Images/{args['dataset']}_gaussian.png")
-                    #         # break
-                    #     return img
-                    color_white_gt = gaussian_noise(color_white_gt)
-
-                ####
 
 
-                color_gt   = render(glctx, 
-                                    mtx_gt, 
-                                    vtx_pos_cube, 
-                                    pos_idx_cube, 
-                                    vtx_col_cube, 
-                                    col_idx_cube, 
-                                    resolution
-                                )
-                color_white_gt_all.append(color_white_gt)
-                color_gt_all.append(color_gt)
-
-                mtx_gu = torch.matmul(
-                            mtx_cam, 
-                            torch.matmul(
-                                translation_to_mtx(result['trans']),
-                                torch.matmul(
-                                    torch.nn.functional.normalize(q_to_mtx(result['quat'])),
-                                    scale_to_mtx(result['scale'])
-                                )
+            color_gt   = render(glctx, 
+                                mvp_gt, 
+                                vtx_pos, 
+                                pos_idx, 
+                                vtx_col, 
+                                col_idx, 
+                                resolution
                             )
-                         )
+            color_white_gt_all.append(color_white_gt)
+            color_gt_all.append(color_gt)
 
-                # pose_total_opt = q_mul_torch(pose_opt, noise)
-                # mtx_total_opt  = torch.matmul(mvp, q_to_mtx(pose_total_opt))
-                color_white_opt = render(glctx, 
-                                         mtx_gu, 
-                                         vtx_pos_cube, 
-                                         pos_idx_cube, 
-                                         vtx_col_cubewhite, 
-                                         col_idx_cube, 
-                                         resolution
-                                        )
-                
-                color_opt       = render(glctx, 
-                                         mtx_gu, 
-                                         vtx_pos_cube, 
-                                         pos_idx_cube, 
-                                         vtx_col_cube, 
-                                         col_idx_cube, 
-                                         resolution
-                                        )
+            # forward
+            # print(q_to_mtx(result['quat']).dtype)
+            # print(translation_to_mtx(result['trans']).dtype)
+            # print(centered_cam.dtype)
+            mtx_gu = torch.matmul(
+                centered_cam, 
+                torch.matmul(
+                    translation_to_mtx(result['trans']),
+                    torch.nn.functional.normalize(q_to_mtx(result['quat']).float())
+                )
+            )
 
-                color_white_opt_all.append(color_white_opt)
-                color_opt_all.append(color_opt)
 
-                # Image-space loss.
-                # diff = (color_white_opt - color_white_gt)**2 # L2 norm.
-                diff = torch.abs(color_white_opt - color_white_gt) # L2 norm.
-                # diff = torch.tanh(5.0 * torch.max(diff, dim=-1)[0])
-                loss = torch.mean(diff)
+            # pose_total_opt = q_mul_torch(pose_opt, noise)
+            # mtx_total_opt  = torch.matmul(mvp, q_to_mtx(pose_total_opt))
+            color_white_opt = render(glctx, mtx_gu, vtx_pos, pos_idx, vtx_col_white, col_idx, resolution)
+            color_opt       = render(glctx, mtx_gu, vtx_pos, pos_idx, vtx_col, col_idx, resolution)
 
-                if loss_all is None:
-                    loss_all = loss
-                else:
-                    loss_all = (loss_all + loss )/2
+            color_white_opt_all.append(color_white_opt)
+            color_opt_all.append(color_opt)
+
+            # Image-space loss.
+            # diff = (color_white_opt - color_white_gt)**2 # L2 norm.
+            diff = torch.abs(color_white_opt - color_white_gt) # L2 norm.
+            # diff = torch.tanh(5.0 * torch.max(diff, dim=-1)[0])
+            loss = torch.mean(diff)
+
+            if loss_all is None:
+                loss_all = loss
+            else:
+                loss_all = (loss_all + loss )/2
             
             # Measure image-space loss and update best found pose.
             loss_val = float(loss_all)
@@ -479,16 +538,6 @@ def fit_pose(max_iter           = 10000,
                 loss_best = loss_val
                 # best_data = result
 
-                
-                color_best_all = color_opt_all
-                color_white_best_all = color_white_opt_all
-
-                if itf < grad_phase_start:
-                    best_data = {
-                        "trans":result['trans'].detach().clone(),
-                        "quat":result['quat'].detach().clone(),
-                        "scale":result['scale'].detach().clone()
-                    }
             # Print/save log.
             if log_interval and (it % log_interval == 0):
                 # err = q_angle_deg(pose_opt, pose_target)
@@ -501,10 +550,10 @@ def fit_pose(max_iter           = 10000,
                 #     log_file.write(s + "\n")
 
             # Run gradient training step.
-            if itf >= grad_phase_start:
-                optimizer.zero_grad()
-                loss_all.backward()
-                optimizer.step()
+            # if itf >= grad_phase_start:
+            optimizer.zero_grad()
+            loss_all.backward()
+            optimizer.step()
 
             # with torch.no_grad():
             #     pose_opt /= torch.sum(pose_opt**2)**0.5
@@ -516,9 +565,9 @@ def fit_pose(max_iter           = 10000,
             if display_image or save_mp4:
                 def getimg_stack(color_imgs):
                     col_imgs = []
-                    for ii in range(5):
+                    for ii in range(1):
                         row_imgs = []
-                        for jj in range(4):
+                        for jj in range(1):
                             img_ref  = color_imgs[ii+jj][0].detach().cpu().numpy()
                             row_imgs.append(img_ref)
                         row_all = np.concatenate(row_imgs, axis=1)[::-1]
@@ -529,18 +578,18 @@ def fit_pose(max_iter           = 10000,
 
                 img_ref  = getimg_stack(color_gt_all)
                 img_opt  = getimg_stack(color_opt_all)
-                img_best = getimg_stack(color_best_all)
+                # img_best = getimg_stack(color_best_all)
                 
                 img_white_ref  = getimg_stack(color_white_gt_all)
                 img_white_opt  = getimg_stack(color_white_opt_all)
-                img_white_best = getimg_stack(color_white_best_all)
+                # img_white_best = getimg_stack(color_white_best_all)
 
                 # print(img_ref.shape)
 
                 # i
 
-                result_white_image = np.concatenate([img_white_ref, img_white_best, img_white_opt], axis=1)
-                result_color_image = np.concatenate([img_ref, img_best, img_opt], axis=1)
+                result_white_image = np.concatenate([img_white_ref, img_white_opt], axis=1)
+                result_color_image = np.concatenate([img_ref, img_opt], axis=1)
                 result_image = np.concatenate([result_white_image,result_color_image],axis=0)
 
                 if display_image:
@@ -567,7 +616,7 @@ def main():
     parser.add_argument('--display-interval', type=int, default=10)
     parser.add_argument('--mp4save-interval', type=int, default=10)
     parser.add_argument('--max-iter', type=int, default=1000)
-    parser.add_argument('--repeats', type=int, default=2)
+    parser.add_argument('--repeats', type=int, default=1)
     parser.add_argument('--add_noise', action='store_true', help="add noise to the segmentation")
     args = parser.parse_args()
 

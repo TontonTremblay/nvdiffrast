@@ -16,6 +16,7 @@ import torch
 import util
 
 import nvdiffrast.torch as dr
+import time 
 
 #----------------------------------------------------------------------------
 # Helpers.
@@ -98,6 +99,7 @@ def fit_earth(max_iter          = 20000,
     # Render.
     ang = 0.0
     texloss_avg = []
+
     for it in range(max_iter + 1):
         # Random rotation/translation matrix for optimization.
         r_rot = util.random_rotation_translation(0.25)
@@ -125,7 +127,15 @@ def fit_earth(max_iter          = 20000,
             texloss_avg.append(float(texloss))
 
         # Render reference and optimized frames. Always enable mipmapping for reference.
+        torch.cuda.synchronize()
+        t = time.time()
+        color = render(glctx, r_mvp, vtx_pos, pos_idx, vtx_uv, uv_idx, tex, 256, True, max_mip_level)
+        print(time.time()-t, color.shape)
+
+
+        t = time.time()
         color = render(glctx, r_mvp, vtx_pos, pos_idx, vtx_uv, uv_idx, tex, ref_res, True, max_mip_level)
+        print(time.time()-t, color.shape)
         color_opt = render(glctx, r_mvp, vtx_pos, pos_idx, vtx_uv, uv_idx, tex_opt, res, enable_mip, max_mip_level)
 
         # Reduce the reference to correct size.

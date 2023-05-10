@@ -134,16 +134,21 @@ def transform_pos(mtx, pos):
     t_mtx = torch.from_numpy(mtx).cuda() if isinstance(mtx, np.ndarray) else mtx
     # (x,y,z) -> (x,y,z,1)
     posw = torch.cat([pos, torch.ones([pos.shape[0], 1]).cuda()], axis=1)
+    # print(posw.shape,t_mtx.t().shape)
+    # raise()
     return torch.matmul(posw, t_mtx.t())[None, ...]
 
 def render(glctx, mtx, pos, pos_idx, col, col_idx, resolution: int):
     # Setup TF graph for reference.
     # print(resolution)
-    # print('pos',pos,pos.shape)
+    print('pos',pos,pos.shape)
     # print('mtx',mtx,mtx.shape)
     pos_clip    = transform_pos(mtx, pos)
     # print('pos_clip',pos_clip,pos_clip.shape)
     rast_out, _ = dr.rasterize(glctx, pos_clip, pos_idx, resolution=[resolution, resolution])
+    # print("rast_out",torch.min(rast_out[0,:,:,2]),torch.max(rast_out[0,:,:,2]))
+    depth = rast_out[0,:,:,2]
+    # raisZe()
     # print('pos_idx',pos_idx,pos_idx.shape)
     # print('rast_out',rast_out,rast_out.shape)
     # print('col',col,col.shape)
@@ -153,7 +158,7 @@ def render(glctx, mtx, pos, pos_idx, col, col_idx, resolution: int):
     color       = dr.antialias(color, rast_out, pos_clip, pos_idx)
     # print('color',color,color.shape)
     # raise()
-    return color
+    return color,depth
 
 def length(v):
     return math.sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2])
@@ -341,9 +346,11 @@ def fit_pose(max_iter           = 10000,
 
             color_white_gt_all = []
             color_gt_all = []
-            color_white_opt_all = []
+            depth_gt_all = []
             color_white_opt_all = []
             color_opt_all = []
+            depth_opt_all = []
+
             loss_all = None
             for i_cam,mtx_cam in enumerate(multiview_cameras):
 
@@ -359,7 +366,8 @@ def fit_pose(max_iter           = 10000,
                                 )
                             )
                          )
-                color_white_gt   = render(glctx, 
+
+                color_white_gt,depth_gt   = render(glctx, 
                                     mtx_gt, 
                                     vtx_pos, 
                                     pos_idx, 
@@ -381,7 +389,7 @@ def fit_pose(max_iter           = 10000,
                 ####
 
 
-                color_gt   = render(glctx, 
+                color_gt,_  = render(glctx, 
                                     mtx_gt, 
                                     vtx_pos, 
                                     pos_idx, 
@@ -391,6 +399,8 @@ def fit_pose(max_iter           = 10000,
                                 )
                 color_white_gt_all.append(color_white_gt)
                 color_gt_all.append(color_gt)
+                depth_gt = depth_gt.unsqueeze(0).unsqueeze(-1)
+                depth_gt_all.append(torch.cat([depth_gt,depth_gt,depth_gt],axis=-1))
 
                 mtx_gu = torch.matmul(
                             mtx_cam, 
@@ -405,12 +415,13 @@ def fit_pose(max_iter           = 10000,
 
                 # pose_total_opt = q_mul_torch(pose_opt, noise)
                 # mtx_total_opt  = torch.matmul(mvp, q_to_mtx(pose_total_opt))
-                color_white_opt = render(glctx, mtx_gu, vtx_pos, pos_idx, vtx_col_white, col_idx, resolution)
-                color_opt       = render(glctx, mtx_gu, vtx_pos, pos_idx, vtx_col, col_idx, resolution)
+                color_white_opt,depth_opt = render(glctx, mtx_gu, vtx_pos, pos_idx, vtx_col_white, col_idx, resolution)
+                color_opt ,_      = render(glctx, mtx_gu, vtx_pos, pos_idx, vtx_col, col_idx, resolution)
 
                 color_white_opt_all.append(color_white_opt)
                 color_opt_all.append(color_opt)
-
+                depth_opt = depth_opt.unsqueeze(0).unsqueeze(-1)
+                depth_opt_all.append(torch.cat([depth_opt,depth_opt,depth_opt],axis=-1))
                 # Image-space loss.
                 # diff = (color_white_opt - color_white_gt)**2 # L2 norm.
                 diff = torch.abs(color_white_opt - color_white_gt) # L2 norm.
@@ -478,7 +489,7 @@ def fit_pose(max_iter           = 10000,
                     gt_final = np.concatenate(col_imgs, axis=0)
                     return cv2.resize(gt_final,(512,512))
 
-                img_ref  = getimg_stack(color_gt_all)
+                img_ref  = getimg_stack(depth_gt_all)
                 img_opt  = getimg_stack(color_opt_all)
                 img_best = getimg_stack(color_best_all)
                 
