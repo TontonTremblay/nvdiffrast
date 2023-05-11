@@ -582,6 +582,15 @@ def fit_pose(max_iter           = 1000,
         #     ).cuda()
 
         # raise()
+        trans_gt = torch.tensor(cam_json['location_world']).cuda()
+        q_gt = torch.tensor(
+                            [
+                                cam_json['quaternion_world_xyzw'][0],
+                                cam_json['quaternion_world_xyzw'][1],
+                                cam_json['quaternion_world_xyzw'][2],
+                                cam_json['quaternion_world_xyzw'][3],
+                            ]).cuda()
+
         gt_mtx_cam =  torch.matmul(
                 translation_to_mtx(
                     torch.tensor(cam_json['location_world'])).cuda(),
@@ -640,13 +649,26 @@ def fit_pose(max_iter           = 1000,
             itf = 1.0 * it / max_iter
             nr = nr_base * nr_falloff**itf
 
-            error = 0.2
+
             # Noise input.
             if cam_guess is None:
 
+                error = 0.20
+                degree_error = np.deg2rad(3)
 
+                q = pyrr.quaternion.create_from_eulers([
+                    random.uniform(-degree_error, degree_error),
+                    random.uniform(-degree_error, degree_error),
+                    random.uniform(-degree_error, degree_error),
+                ])
+                q = pyrr.Quaternion(q)
+                q_gt = pyrr.Quaternion(cam_json['quaternion_world_xyzw'])
+                print(q_gt)
+                print(q)
+                print(q_gt*q)
+                # raise()
                 cam_guess = CameraTorch(
-                    q = np.array(cam_json['quaternion_world_xyzw']),
+                    q = (q_gt*q).xyzw,
                     trans = np.array([
                         cam_json['location_world'][0] + random.uniform(-error, error),
                         cam_json['location_world'][1] + random.uniform(-error, error),
@@ -658,6 +680,9 @@ def fit_pose(max_iter           = 1000,
                     ).cuda()
                 optimizer = torch.optim.Adam(cam_guess.parameters(), betas=(0.9, 0.999), lr=lr_base)
                 result = cam_guess()
+                print('init cam_pose')
+                print(result)
+
             else:
                 result = cam_guess()
 
@@ -723,6 +748,12 @@ def fit_pose(max_iter           = 1000,
             loss = (torch.mean(diff) + torch.mean(diff2))/2
             # loss = torch.mean(diff) 
 
+            # compute ADD
+            gt_points = transform_pos(gt_mtx_cam, vtx_pos) 
+            gu_points = transform_pos(mtx_gu, vtx_pos)
+            
+
+
             if loss_all is None:
                 loss_all = loss
             else:
@@ -743,12 +774,17 @@ def fit_pose(max_iter           = 1000,
                 # ebest = q_angle_deg(pose_best, pose_target)
                 ebest = 0000
                 # s = "rep=%d,iter=%d,err=%f,err_best=%f,loss=%f,loss_best=%f,lr=%f,nr=%f" % (rep, it, err, ebest, loss_val, loss_best, lr, nr)
-                print(f"{it}/{max_iter},loss_val")
+
+
+                # print(f"{it}/{max_iter},'loss',{loss_val},ADD,{add}")
+                print(f"{it}/{max_iter},'loss',{loss_val}")
                 # if log_file:
                 #     log_file.write(s + "\n")
 
             # Run gradient training step.
             # if itf >= grad_phase_start:
+
+            # TODO
             optimizer.zero_grad()
             loss_all.backward()
             optimizer.step()
@@ -761,6 +797,39 @@ def fit_pose(max_iter           = 1000,
             save_mp4      = mp4save_interval and (it % mp4save_interval == 0)
 
             if display_image or save_mp4:
+
+                add = torch.sqrt(torch.sum((gt_points - gu_points)**2,1))
+                add = torch.mean(add)
+
+                # trans error 
+                # print(trans_gt)
+                mtx_gu = torch.inverse(mtx_gu)
+                trans = torch.tensor([
+                    mtx_gu[0][-1].item(),
+                    mtx_gu[1][-1].item(),
+                    mtx_gu[2][-1].item()]).cuda()
+
+                trans_error = torch.sqrt(torch.sum(( trans - trans_gt)**2,0))
+                # print(trans_error)
+                # raise()
+                
+                def quaternion_dot(q1, q2):
+                    return np.dot(q1, q2)
+
+                def quaternion_angle(q1, q2):
+                    dot_product = quaternion_dot(q1, q2)
+                    dot_product = np.clip(dot_product, -1, 1)
+                    angle = 2 * np.arccos(abs(dot_product))
+                    return np.rad2deg(angle)    
+
+                error_rot = quaternion_angle(
+                    q_gt,
+                    pyrr.Matrix33(
+                        mtx_gu[:3,:3].cpu().detach().numpy()
+                        ).quaternion.xyzw                    
+                    )
+
+
                 def getimg_stack(color_imgs,depth=False):
 
                     if depth:
@@ -792,7 +861,6 @@ def fit_pose(max_iter           = 1000,
 
                 img_ref  = getimg_stack([im_gt])
                 # img_ref  = getimg_stack(color_gt_all)
-                im_gt
                 img_opt  = getimg_stack(color_opt_all)
                 
                 img_white_ref  = getimg_stack(color_white_gt_all)
@@ -801,8 +869,47 @@ def fit_pose(max_iter           = 1000,
                 img_gt_depth = getimg_stack(depth_gt_all,depth=True)
                 img_opt_depth = getimg_stack(depth_opt_all,depth=True)
 
-
-                # i
+                # add text 
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                img_opt = cv2.putText(img_opt,
+                    f"ADD: {str(round(add.item(),3)).zfill(2)}", 
+                    (10,30), 
+                    font, 
+                    0.6,
+                    (255,255,255),
+                    1,
+                    2
+                    )
+                img_opt = cv2.putText(img_opt,
+                    f"trans: {str(round(trans_error.item(),3)).zfill(2)}", 
+                    (200,30), 
+                    font, 
+                    0.6,
+                    (255,255,255),
+                    1,
+                    2
+                    )
+                img_opt = cv2.putText(img_opt,
+                    f"rot: {str(round(error_rot,3)).zfill(2)}", 
+                    (10,50), 
+                    font, 
+                    0.6,
+                    (255,255,255),
+                    1,
+                    2
+                    )
+                img_opt = cv2.putText(img_opt,
+                    f"loss: {str(round(loss_val,4 )).zfill(1)}", 
+                    (200,50), 
+                    font, 
+                    0.6,
+                    (255,255,255),
+                    1,
+                    2
+                    )
+                
+                
+                error_rot
 
                 result_white_image = np.concatenate([img_white_ref, img_white_opt], axis=1)
                 result_color_image = np.concatenate([img_ref, img_opt], axis=1)
