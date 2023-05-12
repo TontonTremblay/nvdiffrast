@@ -376,6 +376,9 @@ def fit_pose(max_iter           = 1000,
     # random.seed(101012)
     import random 
     import pyrr
+
+
+
     for rep in range(repeats):
 
         pos_idx = None
@@ -645,6 +648,9 @@ def fit_pose(max_iter           = 1000,
 
         noise_model = torch.distributions.normal.Normal(loc=0, scale=0.3)
 
+
+        cam_poses_guess = []
+
         # raise()
         for it in range(max_iter + 1):
             # Set learning rate.
@@ -827,6 +833,7 @@ def fit_pose(max_iter           = 1000,
                                          ((gt_pose[1]-gu_pose[1])**2)+\
                                          ((gt_pose[2]-gu_pose[2])**2))
                 
+
                 def quaternion_dot(q1, q2):
                     return np.dot(q1, q2)
 
@@ -836,6 +843,9 @@ def fit_pose(max_iter           = 1000,
                     angle = 2 * np.arccos(abs(dot_product))
                     return np.rad2deg(angle)    
 
+                quat_guess = pyrr.Matrix33(
+                        torch.inverse(mtx_gu)[:3,:3].cpu().detach().numpy()
+                        ).quaternion
                 error_rot = quaternion_angle(
                     q_gt,
                     pyrr.Matrix33(
@@ -843,6 +853,7 @@ def fit_pose(max_iter           = 1000,
                         ).quaternion.xyzw                    
                     )
 
+                cam_poses_guess.append([gu_pose,quat_guess.xyzw])
 
                 def getimg_stack(color_imgs,depth=False):
 
@@ -940,6 +951,29 @@ def fit_pose(max_iter           = 1000,
                         break
                 if save_mp4:
                     writer.append_data(np.clip(np.rint(result_image*255.0), 0, 255).astype(np.uint8))
+        
+                # break
+
+        # Draw the cam poses 
+        import open3d as o3d
+        xyz = []
+        for pose in cam_poses_guess:
+            xyz.append(pose[0])
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(xyz)
+        
+        # add gt and 0,0,0
+        tri_origin = o3d.geometry.TriangleMesh.create_coordinate_frame(size = 0.4)
+        cam = o3d.geometry.TriangleMesh.create_coordinate_frame(size = 0.02,origin=gt_pose.numpy())
+        cam.rotate(o3d.geometry.get_rotation_matrix_from_quaternion([q_gt[3],q_gt[0],q_gt[1],q_gt[2]])) 
+        cam_f = o3d.geometry.TriangleMesh.create_coordinate_frame(size = 0.01,origin=pose[0]) 
+        cam_f.rotate(o3d.geometry.get_rotation_matrix_from_quaternion([pose[1][3],pose[1][0],pose[1][1],pose[1][2]])) 
+
+        # o3d.visualization.draw_geometries([pcd,cam_f,cam,tri_origin])
+        o3d.visualization.draw_geometries([pcd,cam_f,cam])
+        
+
+
 
     # Done.
     if writer is not None:
