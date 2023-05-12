@@ -643,6 +643,8 @@ def fit_pose(max_iter           = 1000,
         cam_proj = torch.tensor(cam_thang.get_projection_matrix()).cuda().float()
         print(cam_proj)
 
+        noise_model = torch.distributions.normal.Normal(loc=0, scale=0.3)
+
         # raise()
         for it in range(max_iter + 1):
             # Set learning rate.
@@ -653,7 +655,7 @@ def fit_pose(max_iter           = 1000,
             # Noise input.
             if cam_guess is None:
 
-                error = 0.20
+                error = 0.1
                 degree_error = np.deg2rad(3)
 
                 q = pyrr.quaternion.create_from_eulers([
@@ -678,7 +680,10 @@ def fit_pose(max_iter           = 1000,
                         # cam_json['location_world'][2],
                     ]) 
                     ).cuda()
-                optimizer = torch.optim.Adam(cam_guess.parameters(), betas=(0.9, 0.999), lr=lr_base)
+                optimizer = torch.optim.Adam(cam_guess.parameters(), 
+                    betas=(0.9, 0.999), 
+                    lr=lr_base
+                )
                 result = cam_guess()
                 print('init cam_pose')
                 print(result)
@@ -706,6 +711,7 @@ def fit_pose(max_iter           = 1000,
                                 resolution
                             )
 
+            # depth_gt += noise_model.sample(depth_gt.shape).cuda().float()
 
             color_gt, _   = render(glctx,
                                 cam_proj, 
@@ -801,17 +807,25 @@ def fit_pose(max_iter           = 1000,
                 add = torch.sqrt(torch.sum((gt_points - gu_points)**2,1))
                 add = torch.mean(add)
 
-                # trans error 
-                # print(trans_gt)
-                mtx_gu = torch.inverse(mtx_gu)
-                trans = torch.tensor([
-                    mtx_gu[0][-1].item(),
-                    mtx_gu[1][-1].item(),
-                    mtx_gu[2][-1].item()]).cuda()
-
-                trans_error = torch.sqrt(torch.sum(( trans - trans_gt)**2,0))
-                # print(trans_error)
+                gt_points = transform_pos(gt_mtx_cam, torch.tensor([[0,0,0]]).cuda().float()) 
+                gu_points = transform_pos(mtx_gu, torch.tensor([[0,0,0]]).cuda().float())
+                trans_error = torch.sqrt(torch.sum(( gu_points[0][0][:3] - gt_points[0][0][:3])**2,0))
                 # raise()
+                print(torch.inverse(gt_mtx_cam))
+                gt_pose = torch.tensor([
+                            torch.inverse(gt_mtx_cam)[0][-1].item(),
+                            torch.inverse(gt_mtx_cam)[1][-1].item(),
+                            torch.inverse(gt_mtx_cam)[2][-1].item()
+                        ]) 
+                gu_pose = torch.tensor([
+                            torch.inverse(mtx_gu)[0][-1].item(),
+                            torch.inverse(mtx_gu)[1][-1].item(),
+                            torch.inverse(mtx_gu)[2][-1].item()
+                        ]) 
+
+                trans_error = torch.sqrt(((gt_pose[0]-gu_pose[0])**2)+\
+                                         ((gt_pose[1]-gu_pose[1])**2)+\
+                                         ((gt_pose[2]-gu_pose[2])**2))
                 
                 def quaternion_dot(q1, q2):
                     return np.dot(q1, q2)
@@ -825,7 +839,7 @@ def fit_pose(max_iter           = 1000,
                 error_rot = quaternion_angle(
                     q_gt,
                     pyrr.Matrix33(
-                        mtx_gu[:3,:3].cpu().detach().numpy()
+                        torch.inverse(mtx_gu)[:3,:3].cpu().detach().numpy()
                         ).quaternion.xyzw                    
                     )
 
@@ -865,7 +879,7 @@ def fit_pose(max_iter           = 1000,
                 
                 img_white_ref  = getimg_stack(color_white_gt_all)
                 img_white_opt  = getimg_stack(color_white_opt_all)
-
+                img_white_opt[:,:,1] = img_white_ref[:,:,1]
                 img_gt_depth = getimg_stack(depth_gt_all,depth=True)
                 img_opt_depth = getimg_stack(depth_opt_all,depth=True)
 
